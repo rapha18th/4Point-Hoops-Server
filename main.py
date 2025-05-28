@@ -15,6 +15,7 @@ from firebase_admin import credentials, db, storage, auth
 import firebase_admin
 import logging
 import traceback
+import unicodedata # For accent normalization
 from bs4 import BeautifulSoup, Comment
 
 try:
@@ -240,7 +241,7 @@ def submit_feedback():
         message = data.get('message')
 
         if not feedback_type or not message:
-            return jsonify({'error': 'Feedback type and message are required'}), 400
+            return jsonify({'error': 'Feedback type and message are_required'}), 400
 
         user_data = db.reference(f'users/{uid}').get()
         user_email = user_data.get('email', 'unknown_email')
@@ -525,6 +526,13 @@ def admin_update_credits(uid):
 # NBA Analytics Hub Data Fetching Utilities
 # ——————————————————————————————————————————————
 
+def normalize_string(s):
+    """Removes accent marks and converts to lowercase for consistent comparison."""
+    if not isinstance(s, str):
+        return str(s)
+    s = unicodedata.normalize('NFKD', s).encode('ascii', 'ignore').decode('utf-8')
+    return s.strip()
+
 def clean_firebase_keys(key_name):
     if not isinstance(key_name, str):
         key_name = str(key_name)
@@ -650,26 +658,39 @@ def get_player_index_brscraper():
         return df
 
 def _scrape_player_index_brscraper():
-    try:
-        latest_season_end_year = int(get_available_seasons_util(1)[0].split('–')[1])
-        logging.info(f"Attempting to get player index for year: {latest_season_end_year}")
-        df = nba.get_stats(latest_season_end_year, info='per_game', rename=False)
-        if df.empty or 'Player' not in df.columns:
-            logging.warning(f"Player index DataFrame empty or 'Player' column missing for {latest_season_end_year}.")
-            raise ValueError("No player column or empty DataFrame from BRScraper.")
-        player_names = df['Player'].dropna().unique().tolist()
-        logging.info(f"Successfully retrieved {len(player_names)} players for index.")
-        return pd.DataFrame({'name': player_names})
-    except Exception as e:
-        logging.error(f"Error fetching player index with BRScraper for {latest_season_end_year}: {e}. Falling back to common players.")
-        common_players = [
-            'LeBron James', 'Stephen Curry', 'Kevin Durant', 'Giannis Antetokounmpo',
-            'Nikola Jokic', 'Joel Embiid', 'Jayson Tatum', 'Luka Doncic',
-            'Damian Lillard', 'Jimmy Butler', 'Kawhi Leonard', 'Paul George',
-            'Anthony Davis', 'Rudy Gobert', 'Donovan Mitchell', 'Trae Young',
-            'Devin Booker', 'Karl-Anthony Towns', 'Zion Williamson', 'Ja Morant'
-        ]
-        return pd.DataFrame({'name': common_players})
+    # Prioritize getting real player data from recent seasons
+    seasons_to_try_for_index = get_available_seasons_util(num_seasons=2) # Try current and previous season
+    
+    for season_str in seasons_to_try_for_index:
+        end_year = int(season_str.split('–')[1])
+        try:
+            logging.info(f"Attempting to get player index for year: {end_year} from BRScraper...")
+            df = nba.get_stats(end_year, info='per_game', rename=False)
+            
+            if not df.empty and 'Player' in df.columns:
+                player_names = df['Player'].dropna().unique().tolist()
+                # Normalize player names before returning
+                player_names = [normalize_string(name) for name in player_names]
+                logging.info(f"Successfully retrieved {len(player_names)} players for index from {season_str}.")
+                return pd.DataFrame({'name': player_names})
+            else:
+                logging.warning(f"Player index DataFrame empty or 'Player' column missing for {season_str}. Trying next season.")
+        except Exception as e:
+            logging.warning(f"Error fetching player index with BRScraper for {season_str}: {e}. Trying next season.")
+
+    # Fallback to a curated list if recent seasons fail
+    logging.error("Failed to fetch player index from recent seasons. Falling back to curated common players list.")
+    common_players = [
+        'LeBron James', 'Stephen Curry', 'Kevin Durant', 'Giannis Antetokounmpo',
+        'Nikola Jokic', # No accent here, as it will be normalized
+        'Joel Embiid', 'Jayson Tatum', 'Luka Doncic', # No accent here, as it will be normalized
+        'Damian Lillard', 'Jimmy Butler', 'Kawhi Leonard', 'Paul George',
+        'Anthony Davis', 'Rudy Gobert', 'Donovan Mitchell', 'Trae Young',
+        'Devin Booker', 'Karl-Anthony Towns', 'Zion Williamson', 'Ja Morant',
+        'Shai Gilgeous-Alexander', 'Tyrese Maxey', 'Anthony Edwards', 'Victor Wembanyama',
+        'Jalen Brunson', 'Paolo Banchero', 'Franz Wagner', 'Cade Cunningham'
+    ]
+    return pd.DataFrame({'name': common_players})
 
 def get_player_career_stats_brscraper(player_name, seasons_to_check=10, playoffs=False):
     if not BRSCRAPER_AVAILABLE:
@@ -677,37 +698,55 @@ def get_player_career_stats_brscraper(player_name, seasons_to_check=10, playoffs
         return pd.DataFrame()
     all_rows = []
     
+    # Normalize the input player name for consistent lookup
+    normalized_player_name = normalize_string(player_name)
 
-    seasons_to_try = get_available_seasons_util(seasons_to_check) # Get all potentially available seasons
+    seasons_to_try = get_available_seasons_util(seasons_to_check)
     
     for season_str in seasons_to_try:
         end_year = int(season_str.split('–')[1])
-        try:
-            logging.info(f"DEBUG: Calling nba.get_stats for player '{player_name}' in season {season_str} (year: {end_year}, playoffs: {playoffs})...")
-            
-            df_season = nba.get_stats(end_year, info='per_game', playoffs=playoffs, rename=False)
-            
-            if df_season.empty:
-                logging.warning(f"DEBUG: nba.get_stats returned empty DataFrame for {player_name} in {season_str}. Skipping this season.")
-                continue 
+        
+        # Implement retry logic for each season fetch
+        for attempt in range(3): # Try up to 3 times
+            try:
+                logging.info(f"DEBUG: Attempt {attempt+1} for nba.get_stats for player '{player_name}' in season {season_str} (year: {end_year}, playoffs: {playoffs})...")
+                
+                df_season = nba.get_stats(end_year, info='per_game', playoffs=playoffs, rename=False)
+                
+                if df_season.empty:
+                    logging.warning(f"DEBUG: nba.get_stats returned empty DataFrame for {player_name} in {season_str} on attempt {attempt+1}. Retrying...")
+                    time.sleep(1) # Wait a bit before retrying
+                    continue # Go to next attempt
+                
+                if 'Player' not in df_season.columns:
+                    logging.warning(f"DEBUG: DataFrame for {player_name} in {season_str} has no 'Player' column on attempt {attempt+1}. Columns: {df_season.columns.tolist()}. Retrying...")
+                    time.sleep(1)
+                    continue
 
-            if 'Player' not in df_season.columns:
-                logging.warning(f"DEBUG: DataFrame for {player_name} in {season_str} has no 'Player' column. Columns: {df_season.columns.tolist()}. Skipping this season.")
-                continue 
+                # Normalize player names in the DataFrame for comparison
+                df_season['Player_Normalized'] = df_season['Player'].apply(normalize_string)
+                
+                row = df_season[df_season['Player_Normalized'] == normalized_player_name]
+                
+                if not row.empty:
+                    row = row.copy()
+                    row['Season'] = season_str
+                    # Remove the temporary normalized column before appending
+                    row = row.drop(columns=['Player_Normalized'], errors='ignore')
+                    all_rows.append(row)
+                    logging.info(f"DEBUG: Found stats for {player_name} in {season_str} on attempt {attempt+1}. Appending row.")
+                    break # Break retry loop if successful
+                else:
+                    logging.info(f"DEBUG: Player {player_name} not found in {season_str} stats (after getting season data) on attempt {attempt+1}. Retrying...")
+                    time.sleep(1)
+                    continue # Go to next attempt
 
-            row = df_season[df_season['Player'] == player_name]
-            if not row.empty:
-                row = row.copy()
-                row['Season'] = season_str
-                all_rows.append(row)
-                logging.info(f"DEBUG: Found stats for {player_name} in {season_str}. Appending row.")
-            else:
-                logging.info(f"DEBUG: Player {player_name} not found in {season_str} stats (after getting season data).")
-
-        except Exception as e:
-            # This is where the "not a valid season" error comes from. It's a warning, not a fatal error for the loop.
-            logging.warning(f"DEBUG: Exception when fetching {season_str} {'playoff' if playoffs else 'regular season'} stats for {player_name}: {e}")
-            # traceback.print_exc() # Uncomment for full traceback if needed
+            except Exception as e:
+                logging.warning(f"DEBUG: Exception on attempt {attempt+1} when fetching {season_str} {'playoff' if playoffs else 'regular season'} stats for {player_name}: {e}")
+                time.sleep(1) # Wait before next retry
+                if attempt == 2: # If last attempt failed
+                    logging.error(f"DEBUG: All 3 attempts failed for {player_name} in {season_str}. Giving up on this season.")
+                continue # Go to next attempt
 
     if not all_rows:
         logging.warning(f"DEBUG: No stats found for {player_name} across all attempted seasons. Returning empty DataFrame.")
@@ -730,7 +769,7 @@ def get_player_career_stats_brscraper(player_name, seasons_to_check=10, playoffs
         if col not in non_num:
             df[col] = pd.to_numeric(df[col], errors='coerce')
 
-    df['Player'] = player_name
+    df['Player'] = player_name # Ensure original player name is kept
     df = df.replace({np.nan: None})
     return df
 
@@ -908,19 +947,14 @@ def get_player_stats():
         all_player_season_data = []
         players_with_no_data = []
 
-        # Iterate through each player requested
         for player_name in selected_players:
-            # Call get_player_career_stats_brscraper to get all available seasons for this player
-            # This function will log warnings if specific seasons fail to fetch
             df_player_career = get_player_career_stats_brscraper(player_name, playoffs=False)
             
             if df_player_career.empty:
                 logging.info(f"No career data found for {player_name}. Adding to no_data list.")
                 players_with_no_data.append(player_name)
-                continue # Skip to next player if no career data at all
+                continue
 
-            # Filter the career data for the specific seasons requested in the frontend payload
-            # Note: selected_seasons here is the list of seasons for *all* players in the request
             filtered_df = df_player_career[df_player_career['Season'].isin(selected_seasons)].copy()
             
             if not filtered_df.empty:
@@ -1269,7 +1303,7 @@ def awards_predictor():
             return jsonify({'error': 'Award type and criteria are required'}), 400
         
         prompt = f"Predict top 5 {award_type} candidates based on {criteria}. Focus on 2024-25 season."
-        prediction = ask_perp(prompt,)
+        prediction = ask_perp(prompt)
         if "Error from AI" in prediction:
             return jsonify({'error': prediction}), 500
         
@@ -1302,7 +1336,7 @@ def young_player_projection():
             "4. Comparison to similar players at the same age. 5. Career trajectory prediction. "
             "Base your analysis on historical player development patterns and current NBA trends."
         )
-        projection = ask_perp(prompt, system="You are an NBA projection expert AI.")
+        projection = ask_perp(prompt)
         if "Error from AI" in projection:
             return jsonify({'error': projection}), 500
         
@@ -1328,12 +1362,11 @@ def similar_players():
         if "Error from AI" in similar_players_analysis:
             return jsonify({'error': similar_players_analysis}), 500
         
-        # Extract user ID from auth header
         auth_header = request.headers.get('Authorization', '')
         token = auth_header.split(' ')[1]
         uid = verify_token(token)
 
-        analysis_id = str(uuid.uuid4())  # Unique ID for this analysis
+        analysis_id = str(uuid.uuid4())
 
         if FIREBASE_INITIALIZED:
             user_analyses_ref = db.reference(f'user_analyses/{uid}')
@@ -1354,6 +1387,50 @@ def similar_players():
     
     except Exception as e:
         logging.error(f"Error in /api/nba/similar_players: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/nba/manual_player_compare', methods=['POST'])
+@credit_required(cost=1)
+@cross_origin()
+def manual_player_compare():
+    try:
+        data = request.get_json()
+        player1_name = data.get('player1_name')
+        player1_season = data.get('player1_season')
+        player2_name = data.get('player2_name')
+        player2_season = data.get('player2_season')
+
+        if not player1_name or not player2_name:
+            return jsonify({'error': 'Both player names are required'}), 400
+
+        player1_str = f"{player1_name} ({player1_season} season)" if player1_season else player1_name
+        player2_str = f"{player2_name} ({player2_season} season)" if player2_season else player2_name
+
+        comparison_context = "Statistical comparison"
+        if player1_season and player2_season:
+            comparison_context += f" (specifically {player1_season} vs {player2_season} seasons)"
+        elif player1_season:
+            comparison_context += f" (specifically {player1_season} season for {player1_name} vs {player2_name}'s career/prime)"
+        elif player2_season:
+            comparison_context += f" (specifically {player1_name}'s career/prime vs {player2_season} season for {player2_name})"
+        else:
+            comparison_context += " (career/prime comparison)"
+
+        prompt = (
+            f"Compare {player1_str} vs {player2_str} in detail: "
+            f"1. {comparison_context}. "
+            "2. Playing style similarities and differences. 3. Strengths and weaknesses of each. "
+            "4. Team impact and role. 5. Overall similarity score (1-10). "
+            "Provide a comprehensive comparison with specific examples."
+        )
+        
+        comparison = ask_perp(prompt)
+        if "Error from AI" in comparison:
+            return jsonify({'error': comparison}), 500
+        
+        return jsonify({'comparison': comparison})
+    except Exception as e:
+        logging.error(f"Error in /api/nba/manual_player_compare: {e}")
         return jsonify({'error': str(e)}), 500
 
 
