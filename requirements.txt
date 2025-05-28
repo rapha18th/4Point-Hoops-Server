@@ -1,0 +1,10 @@
+Flask
+Flask-Cors
+firebase-admin
+pandas
+numpy
+requests
+plotly
+BRScraper
+beautifulsoup4
+lxml
