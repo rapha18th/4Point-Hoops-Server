@@ -181,7 +181,7 @@ PERPLEXITY_API_KEY=sk-xxxxxxxx
 
 ```bash
 pip install -r requirements.txt
-python app.py
+python main.py
 ```
 
 ---
